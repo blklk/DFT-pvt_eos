@@ -1,672 +1,703 @@
 #!/usr/bin/env python
 """Tools for fitting 3rd order Birch-Murnaghan EOS"""
+
 import re
 import numpy as np
-import scipy.optimize as spopt
+from scipy.optimize import curve_fit, brentq
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+from matplotlib import ticker, cm
+from typing import List, Tuple, Optional, Callable
+from dataclasses import dataclass, field
+import logging
+import argparse
+from joblib import Parallel, delayed
+from matplotlib.colors import Normalize
 
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# Set matplotlib parameters
 plt.rcParams['font.family'] = 'Arial'
 
-# Some regular expressions that get use a lot,
-# so we compile them when the module is loaded
-_vol_re = re.compile(r'Current cell volume =\s+(\d+\.\d+)\s+A\*\*3')
-_zpe_re = re.compile(r'Zero-point energy =\s+(\d+\.\d+)\s+eV')
-_tmo_re = re.compile(
-    r'(\d+\.\d+)\s+(\d+\.\d+)\s+([+-]?\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)')
-# Get U from the basis set correction at the start of the
-# phonons calculation this assumes we are a restart
-_ufb_re = re.compile(
-    r'Total energy corrected for finite basis set =\s+([+-]?\d+\.\d+)\s+eV')
-# We could also use use the LBFGS report to get enthalpy, I guess this ties us to that optimiser
-_enth_re = re.compile(
-    r'LBFGS: finished iteration\s+\d+ with enthalpy=\s+([+-]?\d+\.\d+E[+-]?\d+)\seV')
-# but that would need the PV term removing (we need hemoltz free energy not gibbs)
-# and the thing at the end of the scf loop lacks the basis set correction ... so
-# remove PV
-_p_re = re.compile(r' *\s+Pressure:\s+([+-]?\d+\.\d+)\s+\*')
+
+# Precompile regular expressions
+@dataclass
+class RegexPatterns:
+    a_re: re.Pattern = field(default_factory=lambda: re.compile(r'\ba\s*=\s*([-\d.]+)'))
+    b_re: re.Pattern = field(default_factory=lambda: re.compile(r'\bb\s*=\s*([-\d.]+)'))
+    c_re: re.Pattern = field(default_factory=lambda: re.compile(r'\bc\s*=\s*([-\d.]+)'))
+    vol_re: re.Pattern = field(default_factory=lambda: re.compile(r'Current cell volume =\s+(\d+\.\d+)\s+A\*\*3'))
+    zpe_re: re.Pattern = field(default_factory=lambda: re.compile(r'Zero-point energy =\s+(\d+\.\d+)\s+eV'))
+    tmo_re: re.Pattern = field(default_factory=lambda: re.compile(
+        r'(\d+\.\d+)\s+(\d+\.\d+)\s+([+-]?\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)'))
+    ufb_re: re.Pattern = field(default_factory=lambda: re.compile(
+        r'Total energy corrected for finite basis set =\s+([+-]?\d+\.\d+)\s+eV'))
+    enth_re: re.Pattern = field(default_factory=lambda: re.compile(
+        r'LBFGS: finished iteration\s+\d+ with enthalpy=\s+([+-]?\d+\.\d+E[+-]?\d+)\seV'))
+    p_re: re.Pattern = field(default_factory=lambda: re.compile(r'\s+Pressure:\s+([+-]?\d+\.\d+)\s+\*'))
 
 
-def fit_BM3_EOS(V, F, V0_guess=None, F0_guess=None,
-                K0_guess=None, Kp0_guess=None, verbose=False):
-    """Fit parameters of a 3rd order BM EOS"""
-    if V0_guess is None:
-        V0_guess = np.mean(V)
-    if F0_guess is None:
-        F0_guess = np.mean(F)
-    if K0_guess is None:
-        K0_guess = 240.0  # Reasonable? in GPa
-    K0_guess = K0_guess / 160.218  # whatever we have, into eV.A**3
-    if Kp0_guess is None:
-        Kp0_guess = 4.0
-
-    popt, pcov, infodict, mesg, ier = spopt.curve_fit(BM3_EOS_energy, V, F,
-                                                      p0=[V0_guess, F0_guess, K0_guess, Kp0_guess],
-                                                      full_output=True, maxfev=10000)
-
-    print(ier)  #  1,2,3 or 4 is okay
-    print(mesg)
-    print("Condition number of covarience matrix", np.linalg.cond(pcov))
-    perr = np.sqrt(np.diag(pcov))
-    V0 = popt[0]
-    V0_err = perr[0]
-    E0 = popt[1]
-    E0_err = perr[1]
-    K0 = popt[2]
-    K0_err = perr[2]
-    Kp0 = popt[3]
-    Kp0_err = perr[3]
-    if verbose:
-        print("Fitted 3rd order Birch-Murnaghan EOS parameters:")
-        print(f" E0  = {E0:7g} eV, sigma = {E0_err:7g} eV")
-        print(f" V0  = {V0:7g} A**3, sigma = {V0_err:7g} A**3")
-        print(f" K0  = {K0:7g} eV.A**-3, sigma = {K0_err:7g} A**3")
-        print(f"   ( = {K0 * 160.218:7g} GPa, sigma = {K0_err * 160.218:7g} GPa)")
-        print(f" K0' = {Kp0:7g}, sigma = {Kp0_err:7g}")
-    return V0, E0, K0, Kp0
+# Instantiate regex patterns
+regex = RegexPatterns()
 
 
-def BM3_EOS_energy(V, V0, E0, K0, Kp0):
+@dataclass
+class BM3EOSParameters:
+    V0: float
+    E0: float
+    K0: float
+    Kp0: float
+    V0_err: float
+    E0_err: float
+    K0_err: float
+    Kp0_err: float
+
+
+def bm3_eos_energy(V: np.ndarray, V0: float, E0: float, K0: float, Kp0: float) -> np.ndarray:
     """Calculate the energy from a 3rd order BM EOS"""
-
-    E = E0 + ((9.0 * V0 * K0) / 16.0) * ((((V0 / V) ** (2.0 / 3.0) - 1.0) ** 3.0) * Kp0 +
-                                         (((V0 / V) ** (2.0 / 3.0) - 1.0) ** 2.0 * (
-                                                 6.0 - 4.0 * (V0 / V) ** (2.0 / 3.0))))
+    eta = (V0 / V) ** (2.0 / 3.0) - 1.0
+    E = E0 + (9.0 * V0 * K0 / 16.0) * (
+            (eta ** 3.0) * Kp0 + (eta ** 2.0) * (6.0 - 4.0 * (V0 / V) ** (2.0 / 3.0))
+    )
     return E
 
 
-def fit_BM3_pressure_EOS(P, V, verbose=False):
-    """Fit parameters of a 3rd order BM EOS from PV data"""
-    V0_guess = np.mean(V)
-    K0_guess = 240.0  # eV.A**3 (which is approx 27000 GPa)
-    # preserved as default for back compat
-    Kp0_guess = 4.0
-
-    popt, pcov, infodict, mesg, ier = spopt.curve_fit(BM3_EOS_pressure, V, P,
-                                                      p0=[V0_guess, K0_guess, Kp0_guess],
-                                                      full_output=True, maxfev=10000)
-
-    print(ier)  #  1,2,3 or 4 is okay
-    print(mesg)
-    print("Condition number of covarience matrix", np.linalg.cond(pcov))
-    perr = np.sqrt(np.diag(pcov))
-    V0 = popt[0]
-    V0_err = perr[0]
-    K0 = popt[1]
-    K0_err = perr[1]
-    Kp0 = popt[2]
-    Kp0_err = perr[2]
-    if verbose:
-        print("Fitted 3rd order Birch-Murnaghan EOS parameters:")
-        print(f" V0  = {V0:7g} A**3, sigma = {V0_err:7g} A**3")
-        print(f" K0  = {K0:7g} GPa, sigma = {K0_err:7g} GPa")
-        print(f"   ( = {K0 / 160.218:7g} eV.A**-3, sigma = {K0_err / 160.218:7g} eV.A**-3)")
-        print(f" K0' = {Kp0:7g}, sigma = {Kp0_err:7g}")
-    return V0, K0, Kp0
-
-
-def BM3_EOS_pressure(V, V0, K0, Kp0):
+def bm3_eos_pressure(V: np.ndarray, V0: float, K0: float, Kp0: float) -> np.ndarray:
     """Calculate the pressure from a 3rd order BM EOS"""
-
-    P = (3.0 * K0 / 2.0) * ((V0 / V) ** (7.0 / 3.0) - (V0 / V) ** (5.0 / 3.0)) * \
-        (1.0 + (3.0 / 4.0) * (Kp0 - 4.0) * ((V0 / V) ** (2.0 / 3.0) - 1))
+    eta = (V0 / V) ** (2.0 / 3.0) - 1.0
+    term1 = (V0 / V) ** (7.0 / 3.0) - (V0 / V) ** (5.0 / 3.0)
+    term2 = 1.0 + (3.0 / 4.0) * (Kp0 - 4.0) * eta
+    P = (3.0 * K0 / 2.0) * term1 * term2
     return P
 
 
-def fit_parameters_quad(Ts, V0s, E0s, K0s, Kp0s,
-                        plot=False, filename=None, table=None):
-    poptv, pconv = spopt.curve_fit(_quint_func, np.array(Ts),
-                                   np.array(V0s), p0=[0.0, 0.0, 0.0,
-                                                      0.0, 0.0, np.mean(V0s)])
-    fV0 = lambda t: _quint_func(t, poptv[0], poptv[1], poptv[2],
-                                poptv[3], poptv[4], poptv[5])
+def fit_eos(
+        V: np.ndarray,
+        F: np.ndarray,
+        initial_guesses: Optional[List[float]] = None,
+        verbose: bool = False
+) -> BM3EOSParameters:
+    """Fit parameters of a 3rd order BM EOS using energy data"""
+    if initial_guesses is None:
+        initial_guesses = [
+            np.mean(V),  # V0_guess
+            np.mean(F),  # E0_guess
+            240.0 / 160.218,  # K0_guess in eV.A**3
+            4.0  # Kp0_guess
+        ]
 
-    popte, pconv = spopt.curve_fit(_quint_func, np.array(Ts),
-                                   np.array(E0s), p0=[0.0, 0.0, 0.0,
-                                                      0.0, 0.0, np.mean(E0s)])
-    fE0 = lambda t: _quint_func(t, popte[0], popte[1], popte[2],
-                                popte[3], popte[4], popte[5])
+    try:
+        popt, pcov = curve_fit(
+            bm3_eos_energy,
+            V,
+            F,
+            p0=initial_guesses,
+            maxfev=10000
+        )
+    except RuntimeError as e:
+        logging.error(f"Curve fitting failed: {e}")
+        raise
 
-    poptk, pconv = spopt.curve_fit(_quint_func, np.array(Ts),
-                                   np.array(K0s), p0=[0.0, 0.0, 0.0,
-                                                      0.0, 0.0, np.mean(K0s)])
-    fK0 = lambda t: _quint_func(t, poptk[0], poptk[1], poptk[2],
-                                poptk[3], poptk[4], poptk[5])
+    perr = np.sqrt(np.diag(pcov))
+    parameters = BM3EOSParameters(
+        V0=popt[0],
+        E0=popt[1],
+        K0=popt[2],
+        Kp0=popt[3],
+        V0_err=perr[0],
+        E0_err=perr[1],
+        K0_err=perr[2],
+        Kp0_err=perr[3]
+    )
 
-    poptkp, pconv = spopt.curve_fit(_quint_func, np.array(Ts),
-                                    np.array(Kp0s), p0=[0.0, 0.0, 0.0,
-                                                        0.0, 0.0, np.mean(Kp0s)])
-    fKp0 = lambda t: _quint_func(t, poptkp[0], poptkp[1], poptkp[2],
-                                 poptkp[3], poptkp[4], poptkp[5])
+    if verbose:
+        logging.info("Fitted 3rd order Birch-Murnaghan EOS parameters:")
+        logging.info(f" E0  = {parameters.E0:7g} eV ± {parameters.E0_err:7g} eV")
+        logging.info(f" V0  = {parameters.V0:7g} Å³ ± {parameters.V0_err:7g} Å³")
+        logging.info(f" K0  = {parameters.K0 * 160.218:7g} GPa ± {parameters.K0_err * 160.218:7g} GPa")
+        logging.info(f" K0' = {parameters.Kp0:7g} ± {parameters.Kp0_err:7g}")
 
-    if table is not None:
-        # Write out (LaTeX) table of EOS fitting functions
-        fh = open(table, 'w')
-        fh.write('$F_0(T) = ' + _f_2_latex(popte[0], noplus=True) + 'T^5'
-                 + _f_2_latex(popte[1]) + 'T^4'
-                 + _f_2_latex(popte[2]) + 'T^3'
-                 + _f_2_latex(popte[3]) + 'T^2'
-                 + _f_2_latex(popte[4]) + 'T'
-                 + _f_2_latex(popte[5]) + '$\n')
-        fh.write('$V_0(T) = ' + _f_2_latex(poptv[0], noplus=True) + 'T^5'
-                 + _f_2_latex(poptv[1]) + 'T^4'
-                 + _f_2_latex(poptv[2]) + 'T^3'
-                 + _f_2_latex(poptv[3]) + 'T^2'
-                 + _f_2_latex(poptv[4]) + 'T'
-                 + _f_2_latex(poptv[5]) + '$\n')
-        fh.write('$K_0(T) = ' + _f_2_latex(poptk[0] * 160.218, noplus=True) + 'T^5'
-                 + _f_2_latex(poptk[1] * 160.218) + 'T^4'
-                 + _f_2_latex(poptk[2] * 160.218) + 'T^3'
-                 + _f_2_latex(poptk[3] * 160.218) + 'T^2'
-                 + _f_2_latex(poptk[4] * 160.218) + 'T'
-                 + _f_2_latex(poptk[5] * 160.218) + '$\n')
-        fh.write('$K^{\prime}_0(T) = ' + _f_2_latex(poptkp[0], noplus=True) + 'T^5'
-                 + _f_2_latex(poptkp[1]) + 'T^4'
-                 + _f_2_latex(poptkp[2]) + 'T^3'
-                 + _f_2_latex(poptkp[3]) + 'T^2'
-                 + _f_2_latex(poptkp[4]) + 'T'
-                 + _f_2_latex(poptkp[5]) + '$\n')
-        fh.close
+    return parameters
+
+
+def fit_pressure_eos(
+        P: np.ndarray,
+        V: np.ndarray,
+        initial_guesses: Optional[List[float]] = None,
+        verbose: bool = False
+) -> BM3EOSParameters:
+    """Fit parameters of a 3rd order BM EOS using pressure data"""
+    if initial_guesses is None:
+        initial_guesses = [
+            np.mean(V),  # V0_guess
+            240.0 / 160.218,  # K0_guess in eV.A**3
+            4.0  # Kp0_guess
+        ]
+
+    try:
+        popt, pcov = curve_fit(
+            bm3_eos_pressure,
+            V,
+            P / 160.218,  # Convert GPa to eV.A**3
+            p0=initial_guesses,
+            maxfev=10000
+        )
+    except RuntimeError as e:
+        logging.error(f"Pressure EOS fitting failed: {e}")
+        raise
+
+    perr = np.sqrt(np.diag(pcov))
+    parameters = BM3EOSParameters(
+        V0=popt[0],
+        E0=0.0,  # Not used in pressure fitting
+        K0=popt[1],
+        Kp0=popt[2],
+        V0_err=perr[0],
+        E0_err=0.0,
+        K0_err=perr[1],
+        Kp0_err=perr[2]
+    )
+
+    if verbose:
+        logging.info("Fitted 3rd order Birch-Murnaghan EOS parameters (Pressure Fit):")
+        logging.info(f" V0  = {parameters.V0:7g} Å³ ± {parameters.V0_err:7g} Å³")
+        logging.info(f" K0  = {parameters.K0 * 160.218:7g} GPa ± {parameters.K0_err * 160.218:7g} GPa")
+        logging.info(f" K0' = {parameters.Kp0:7g} ± {parameters.Kp0_err:7g}")
+
+    return parameters
+
+
+def quintic_function(x: np.ndarray, a: float, b: float, c: float, d: float, e: float, f: float) -> np.ndarray:
+    """Quintic polynomial function"""
+    return a * x ** 5 + b * x ** 4 + c * x ** 3 + d * x ** 2 + e * x + f
+
+
+def format_latex(value: float, prec: int = 2, noplus: bool = False) -> str:
+    """Format a float into LaTeX scientific notation"""
+    fmt = f'{{:{"+" if not noplus else ""}.{prec}e}}'
+    base, exponent = fmt.format(value).split('e')
+    exponent = exponent.lstrip('+').lstrip('0').replace('-0', '-', 1)
+    return f"{base}\\times 10^{{{exponent}}}"
+
+
+def fit_parameters_quintic(
+        Ts: np.ndarray,
+        V0s: np.ndarray,
+        E0s: np.ndarray,
+        K0s: np.ndarray,
+        Kp0s: np.ndarray,
+        plot: bool = False,
+        filename: Optional[str] = None,
+        table: Optional[str] = None
+) -> Tuple[Callable[[float], float], Callable[[float], float],
+Callable[[float], float], Callable[[float], float]]:
+    """Fit quintic polynomials to BM3 EOS parameters as functions of temperature"""
+    params = {}
+    fitted_funcs = {}
+
+    for param_name, data in zip(['V0', 'E0', 'K0', 'Kp0'], [V0s, E0s, K0s, Kp0s]):
+        popt, _ = curve_fit(quintic_function, Ts, data, maxfev=10000)
+        fitted_funcs[param_name] = lambda t, popt=popt: quintic_function(t, *popt)
+
+    if table:
+        with open(table, 'w') as fh:
+            for param in ['E0', 'V0', 'K0', 'Kp0']:
+                popt = None
+                if param == 'E0':
+                    popt = curve_fit(quintic_function, Ts, E0s)[0]
+                elif param == 'V0':
+                    popt = curve_fit(quintic_function, Ts, V0s)[0]
+                elif param == 'K0':
+                    popt = curve_fit(quintic_function, Ts, K0s)[0]
+                elif param == 'Kp0':
+                    popt = curve_fit(quintic_function, Ts, Kp0s)[0]
+
+                expr = ' + '.join([f"{format_latex(coef, noplus=True)}T^{5 - i}" for i, coef in enumerate(popt[:5])])
+                expr += f" + {format_latex(popt[5], noplus=True)}"
+                fh.write(f"${param}(T) = {expr}$\n")
 
     if plot:
-        import matplotlib
-        if filename is not None:
-            matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        fTs = np.linspace(0, np.max(Ts), 100)
-        if filename is not None:
-            fig = plt.figure(figsize=(14.0, 14.0), dpi=900)
-            # fig.subplots_adjust(left=0.2, right=0.8, top=0.8, bottom=0.2)
-        else:
-            fig = plt.figure()
-        ax = fig.add_subplot(221)
-        ax.plot(Ts, V0s, 'ko')
-        ax.plot(fTs, fV0(fTs), 'k-')
-        ax.set_xlabel('Temperature (K)')
-        ax.set_ylabel('V$_0$ (A$^3$)')
-        ax = fig.add_subplot(222)
-        ax.plot(Ts, np.array(K0s) * 160.218, 'ko')
-        ax.plot(fTs, fK0(fTs) * 160.218, 'k-')
-        ax.set_xlabel('T (K)')
-        ax.set_ylabel('K$_0$ (GPa)')
-        ax = fig.add_subplot(223)
-        ax.plot(Ts, Kp0s, "ko")
-        ax.plot(fTs, fKp0(fTs), 'k-')
-        ax.set_xlabel('Temperature (K)')
-        ax.set_ylabel(r'K$^{\prime}$$_0$')  # Ugly hack to work around
-        # matplotlib LaTeX bug.
-        ax = fig.add_subplot(224)
-        ax.plot(Ts, E0s, 'ko')
-        ax.plot(fTs, fE0(fTs), 'k-')
-        ax.set_xlabel('Temperature (K)')
-        ax.set_ylabel("F$_0$ (eV)")
-        if filename is not None:
-            plt.savefig(filename, dpi=900)
-        else:
-            plt.show()
+        plt.figure(figsize=(14, 10))
+        fTs = np.linspace(np.min(Ts), np.max(Ts), 300)
 
-    return fV0, fE0, fK0, fKp0
+        plt.subplot(2, 2, 1)
+        plt.scatter(Ts, V0s, color='black', label='Data')
+        plt.plot(fTs, fitted_funcs['V0'](fTs), 'k-', label='Fit')
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('V$_0$ (Å³)')
+        # plt.legend()
 
+        plt.subplot(2, 2, 2)
+        plt.scatter(Ts, E0s, color='black', label='Data')
+        plt.plot(fTs, fitted_funcs['E0'](fTs), 'k-', label='Fit')
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('E$_0$ (eV)')
+        # plt.legend()
 
-def _quint_func(x, a, b, c, d, e, f):
-    return a * x ** 5.0 + b * x ** 4.0 + c * x ** 3.0 + d * x ** 2.0 + e * x + f
+        plt.subplot(2, 2, 3)
+        plt.scatter(Ts, K0s * 160.218, color='black', label='Data')  # Convert to GPa
+        plt.plot(fTs, fitted_funcs['K0'](fTs) * 160.218, 'k-', label='Fit')
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('K$_0$ (GPa)')
+        # plt.legend()
 
+        plt.subplot(2, 2, 4)
+        plt.scatter(Ts, Kp0s, color='black', label='Data')
+        plt.plot(fTs, fitted_funcs['Kp0'](fTs), 'k-', label='Fit')
+        plt.xlabel('Temperature (K)')
+        plt.ylabel(r"K$^{\prime}_0$")
+        # plt.legend()
 
-def _f_2_latex(value, prec=2, mathmode=True, noplus=False):
-    if noplus:
-        fmt = '{:.' + str(prec) + 'e}'
-    else:
-        fmt = '{:+.' + str(prec) + 'e}'
-    basestr = fmt.format(value).split('e')[0]
-    expnstr = fmt.format(value).split('e')[1].lstrip('+').lstrip('0').replace('-0', '-', 1)
-    latex = basestr + r'\times 10^{' + expnstr + '}'
-    if not mathmode:
-        latex = '$' + latex + '$'
-    return latex
-
-
-def BM3_EOS_energy_plot(V, F, V0, E0, K0, Kp0, filename=None, Ts=None,
-                        staticV=None, staticF=None, staticV0=None, staticE0=None,
-                        staticK0=None, staticKp0=None, ax=None):
-    import matplotlib
-    if filename is not None:
-        matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    doplot = False
-    if ax is None:
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        doplot = True
-
-    if isinstance(V, np.ndarray):
-        ax.scatter(V, F)
-        fine_vs = np.linspace(np.min(V), np.max(V), 100)
-        fine_fs = BM3_EOS_energy(fine_vs, V0, E0, K0, Kp0)
-        ax.plot(fine_vs, fine_fs, 'r-')
-    else:
-        # Assume we can iteratte on T
-        cmap = matplotlib.cm.ScalarMappable(cmap='hot')
-        cmap.set_clim(vmin=0, vmax=max(Ts) * 1.5)
-        for i in range(len(Ts)):
-            fine_vs = np.linspace(np.min(V[i]), np.max(V[i]), 100)
-            fine_fs = BM3_EOS_energy(fine_vs, V0[i], E0[i], K0[i], Kp0[i])
-            c = cmap.to_rgba(Ts[i])
-            ax.plot(fine_vs, fine_fs, '--', color=c)
-            ax.plot(V[i], F[i], 'o', color=c, label='{:5g} K'.format(Ts[i]))
-        if staticV is not None:
-            # Add the static line
-            fine_vs = np.linspace(np.min(staticV[i]),
-                                  np.max(staticV[i]), 100)
-            fine_fs = BM3_EOS_energy(fine_vs, staticV0, staticE0,
-                                     staticK0, staticKp0)
-            ax.plot(fine_vs, fine_fs, '-k', color=c)
-            ax.plot(staticV, staticF, 'sk', label='static')
-        ax.legend(ncol=3, bbox_to_anchor=(0., 0.96, 1., .102), loc=3,
-                  mode="expand", borderaxespad=0., numpoints=1)
-
-    ax.set_xlabel('Volume (A$^3$)')
-    ax.set_ylabel('Helmholtz free energy (eV)')
-    if doplot:
-        if filename is not None:
-            plt.savefig(filename, dpi=900)
+        plt.tight_layout()
+        if filename:
+            plt.savefig(filename, dpi=300)
+            plt.close()
         else:
             plt.show()
 
+    return fitted_funcs['V0'], fitted_funcs['E0'], fitted_funcs['K0'], fitted_funcs['Kp0']
 
-def BM3_EOS_pressure_plot(Vmin, Vmax, V0, K0, Kp0, ax=None,
-                          filename=None, Ts=None, leg=True):
-    import matplotlib
-    if filename is not None:
-        matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    doplot = False
-    if ax is None:
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        doplot = True
 
-    if isinstance(V0, np.ndarray):
-        fine_vs = np.linspace(Vmin, Vmax, 100)
-        fine_ps = BM3_EOS_pressure(fine_vs, V0, K0, Kp0)
-        fine_ps = fine_ps * 160.218
-        ax.plot(fine_ps, fine_vs, 'r-')
+def parse_castep_file(
+        filename: str,
+        verbose: bool = False
+) -> Tuple[List[Tuple], List[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Parse a Castep output file and extract thermodynamic data.
+
+    Returns:
+        data: List of tuples containing (V, U, zpe, T, E, F, S, Cv, P, a, b, c)
+        ts: List of temperatures extracted
+        a, b, c: Lattice parameters from the last parsed data block
+    """
+    data = []
+    ts = []
+    a, b, c = None, None, None
+    current_volume = None
+    U, H, zpe, P = None, None, None, None
+    in_thermo = False
+    skip_lines = 0
+
+    with open(filename, 'r') as fh:
+        for line in fh:
+            if skip_lines > 0:
+                skip_lines -= 1
+                continue
+
+            # Volume
+            vol_match = regex.vol_re.search(line)
+            if vol_match:
+                current_volume = float(vol_match.group(1))
+                if verbose:
+                    logging.debug(f"Volume: {current_volume} Å³")
+                continue
+
+            # Lattice parameters
+            for param, regex_re in zip(['a', 'b', 'c'], [regex.a_re, regex.b_re, regex.c_re]):
+                match = regex_re.search(line)
+                if match:
+                    value = float(match.group(1))
+                    if param == 'a':
+                        a = value
+                    elif param == 'b':
+                        b = value
+                    elif param == 'c':
+                        c = value
+                    if verbose:
+                        logging.debug(f"{param}: {value} Å")
+                    break
+            else:
+                # Internal energy
+                match = regex.ufb_re.search(line)
+                if match:
+                    U = float(match.group(1))
+                    if verbose:
+                        logging.debug(f"Internal Energy (U): {U} eV")
+                    continue
+
+                # Enthalpy
+                match = regex.enth_re.search(line)
+                if match:
+                    H = float(match.group(1))
+                    if verbose:
+                        logging.debug(f"Enthalpy (H): {H} eV")
+                    continue
+
+                # Pressure
+                match = regex.p_re.search(line)
+                if match:
+                    P = float(match.group(1))
+                    if verbose:
+                        logging.debug(f"Pressure (P): {P} GPa")
+                    continue
+
+                # Zero-point energy
+                match = regex.zpe_re.search(line)
+                if match:
+                    zpe = float(match.group(1))
+                    if verbose:
+                        logging.debug(f"Zero-point Energy (ZPE): {zpe} eV")
+                    in_thermo = True
+                    skip_lines = 3  # Skip next three lines
+                    continue
+
+                # Thermodynamic data
+                if in_thermo:
+                    tmo_match = regex.tmo_re.search(line)
+                    if tmo_match:
+                        T = float(tmo_match.group(1))
+                        E = float(tmo_match.group(2))
+                        F = float(tmo_match.group(3))
+                        S = float(tmo_match.group(4))
+                        Cv = float(tmo_match.group(5))
+
+                        # Calculate U from H and P
+                        if H is not None and P is not None and current_volume is not None:
+                            U_calc = H - (current_volume * P / 160.21766208)
+                        else:
+                            U_calc = U  # Fallback
+
+                        if verbose:
+                            logging.debug(f"T: {T} K, U: {U_calc} eV, F: {F} eV")
+
+                        # Apply temperature filter
+                        if T < 2500.0 and T != 0.0:
+                            data.append((current_volume, U_calc, zpe, T, E, F, S, Cv, P, a, b, c))
+                            ts.append(T)
+                        continue
+                    else:
+                        # End of thermo block
+                        in_thermo = False
+                        zpe = None
+                        U = None
+                        current_volume = None
+                        a, b, c = None, None, None
+
+    return data, ts, a, b, c
+
+
+def get_VF(
+        data_table: List[Tuple],
+        T: float
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Extract Volume and Free Energy for a given temperature from the data table.
+
+    Args:
+        data_table: Parsed data from Castep files.
+        T: Temperature in K or 'static'.
+
+    Returns:
+        V: Array of volumes (Å³)
+        F: Array of Helmholtz free energies (eV)
+        P: Array of pressures (GPa) if T == 'static', else None
+    """
+    if T == 'static':
+        mode = 'static'
+    elif T == 0.0:
+        mode = 'zpe'
     else:
-        # Assume we can iteratte on T
-        cmap = matplotlib.cm.ScalarMappable(cmap='hot')
-        cmap.set_clim(vmin=0, vmax=max(Ts) * 1.5)
-        for i in range(len(Ts)):
-            fine_vs = np.linspace(Vmin, Vmax, 100)
-            fine_ps = BM3_EOS_pressure(fine_vs, V0[i], K0[i], Kp0[i])
-            # Put in GPa
-            fine_ps = fine_ps * 160.218
-            c = cmap.to_rgba(Ts[i])
-            ax.plot(fine_ps[:], fine_vs[:], '-', color=c,
-                    label='{:5g} K'.format(Ts[i]))
-            ax = plt.gca()
-            ax.xaxis.set_major_locator(ticker.MultipleLocator(base=10))
-            ax.yaxis.set_major_locator(ticker.MultipleLocator(base=5))
+        mode = 'f'
 
-            # ax.xaxis.set_minor_locator(ticker.MultipleLocator(base=10))
-            # ax.yaxis.set_minor_locator(ticker.MultipleLocator(base=5))
-            ax.tick_params(axis='x', which='both', top=True, direction='in', length=3, labelsize=10)
-            ax.tick_params(axis='y', which='both', right=True, direction='in', length=3, labelsize=10)
-            # ax.tick_params(which='major', direction='in', length=5, labelsize=10)
-            ## plt.xlim(-3, 103)
-            ## plt.ylim(130, 176)
-        if leg: ax.legend()
-        plt.legend(frameon=False, fontsize=10, loc="upper right")
+    V, F, P = [], [], []
+    for entry in data_table:
+        entry_T = entry[3]
+        if (entry_T == T) or (mode != 'f' and entry_T == data_table[0][3]):
+            V.append(entry[0])
+            if mode == 'static':
+                F.append(entry[1])  # U(V)
+                P.append(entry[8])
+            elif mode == 'zpe':
+                F.append(entry[1] + entry[2])  # U(V) + ZPE(V)
+            else:
+                F.append(entry[5] + entry[1])  # F = U + F_vib
+    V = np.array(V)
+    F = np.array(F)
+    if mode == 'static':
+        P = np.array(P)
+        return V, F, P
+    return V, F, None
 
+
+def get_volume(
+        P: float,
+        T: float,
+        fV0: Callable[[float], float],
+        fK0: Callable[[float], float],
+        fKp0: Callable[[float], float],
+        max_expansion: int = 10
+) -> float:
+    """
+    Calculate the volume for a given pressure and temperature using BM3 EOS.
+
+    Args:
+        P: Pressure in GPa.
+        T: Temperature in K.
+        fV0, fK0, fKp0: Functions returning V0, K0, Kp0 as functions of T.
+        max_expansion: Maximum number of expansion attempts.
+
+    Returns:
+        Volume in Å³.
+    """
+    P_eVA3 = P / 160.218  # Convert GPa to eV/Å³
+    V0 = fV0(T)
+    K0 = fK0(T)
+    Kp0 = fKp0(T)
+
+    def pressure_diff(V):
+        return bm3_eos_pressure(V, V0, K0, Kp0) - P_eVA3
+
+    a, b = 0.8 * V0, 1.2 * V0
+    attempts = max_expansion
+
+    while attempts > 0:
+        try:
+            return brentq(pressure_diff, a, b)
+        except ValueError:
+            a *= 0.9
+            b *= 1.1
+            attempts -= 1
+            logging.warning(f"Adjusting search interval for volume. Attempts left: {attempts}")
+
+    raise ValueError("Could not find root after expanding the interval")
+
+
+def plot_eos_energy(
+        V: np.ndarray,
+        F: np.ndarray,
+        parameters: BM3EOSParameters,
+        T: float,
+        ax: Optional[plt.Axes] = None
+):
+    """Plot energy vs volume with BM3 EOS fit"""
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    ax.scatter(V, F, color='k', marker='o', label=f'Data {T} K')
+    V_fine = np.linspace(np.min(V), np.max(V), 100)
+    F_fit = bm3_eos_energy(V_fine, parameters.V0, parameters.E0, parameters.K0, parameters.Kp0)
+    ax.plot(V_fine, F_fit, 'k--') #, label=f'BM3 Fit {T} K')
+    ax.set_xlabel('Volume (Å³)')
+    ax.set_ylabel('Helmholtz Free Energy (eV)')
+    ax.legend(ncol=3, bbox_to_anchor=(0., 0.96, 1., .102), loc=3,
+              mode="expand", borderaxespad=0., numpoints=1)
+
+
+def plot_eos_pressure(
+        V_fine: np.ndarray,
+        P_fit: np.ndarray,
+        parameters: BM3EOSParameters,
+        T: float,
+        ax: Optional[plt.Axes] = None
+):
+    """Plot pressure vs volume with BM3 EOS fit"""
+    if ax is None:
+        fig, ax = plt.subplots()
+
+    ax.plot(P_fit, V_fine, 'k-') #, label=f'BM3 Fit {T} K')
     ax.set_xlabel('Pressure (GPa)')
-    ax.set_ylabel('Volume (A$^3$)')
-    if doplot:
-        if filename is not None:
-            plt.savefig(filename, dpi=900)
-        else:
-            plt.show()
+    ax.set_ylabel('Volume (Å³)')
+    ax.legend()
 
 
-def BM3_EOS_twoplots(minV, maxV, Vs, Fs, V0s, E0s, K0s,
-                     Kp0s, Ts, filename=None):
-    import matplotlib
-    if filename is not None:
-        matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    fig = plt.figure(figsize=(5.83, 8.27), dpi=150)
-    fig.subplots_adjust(left=0.2, right=0.9, top=0.9, bottom=0.1)
-    ax1 = fig.add_subplot(211)
-    BM3_EOS_energy_plot(Vs, Fs, V0s, E0s, K0s, Kp0s, Ts=Ts, ax=ax1)
-    ax2 = fig.add_subplot(212)
-    BM3_EOS_pressure_plot(minV, maxV, V0s, K0s,
-                          Kp0s, Ts=Ts, ax=ax2, leg=False)
-    if filename is not None:
+def plot_twoplots(
+        min_V: float,
+        max_V: float,
+        vs: List[np.ndarray],
+        fs: List[np.ndarray],
+        eos_params: List[BM3EOSParameters],
+        Ts: List[float],
+        filename: Optional[str] = None
+):
+    """Create stacked energy and pressure plots with consistent legends"""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 12))
+
+    # Create a colormap
+    cmap = cm.inferno # other options: 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'viridis',
+    norm = Normalize(vmin=min(Ts), vmax=max(Ts))
+
+    # Energy Plot
+    for V, F, params, T in zip(vs, fs, eos_params, Ts):
+        color = cmap(norm(T))
+        V_fine = np.linspace(np.min(V), np.max(V), 100)
+        F_fit = bm3_eos_energy(V_fine, params.V0, params.E0, params.K0, params.Kp0)
+        ax1.plot(V_fine, F_fit, color=color, linestyle='--') #, label=f'BM3 Fit {T} K')
+        ax1.scatter(V, F, color=color, marker='o', label=f'{T} K')
+    ax1.set_xlabel('Volume (Å³)')
+    ax1.set_ylabel('Helmholtz Free Energy (eV)')
+    ax1.legend(ncol=3, bbox_to_anchor=(0., 1.02, 1., .102), loc=3,
+              mode="expand", borderaxespad=1.02, numpoints=1)
+    ax1.set_title('Helmholtz Free Energy vs Volume')
+
+    # Pressure Plot
+    for params, T in zip(eos_params, Ts):
+        if T == 'static' or T == 0.0:
+            continue  # Skip static and 0K for pressure plot
+        color = cmap(norm(T))
+        V_fine = np.linspace(min_V, max_V, 100)
+        P_fit = bm3_eos_pressure(V_fine, params.V0, params.K0, params.Kp0) * 160.218  # GPa
+        ax2.plot(P_fit, V_fine, color=color, linestyle='-', label=f'{T} K')
+    ax2.set_xlabel('Pressure (GPa)')
+    ax2.set_ylabel('Volume (Å³)')
+    ax2.legend(loc='best', fontsize=8)
+    ax2.set_title('Pressure vs Volume')
+
+    plt.tight_layout()
+    if filename:
         plt.savefig(filename, dpi=900)
+        plt.close()
     else:
         plt.show()
 
 
-def get_V(P, T, fV0, fK0, fKp0):
-    P = P / 160.218
-    V0 = fV0(T)
-    K0 = fK0(T)
-    Kp0 = fKp0(T)
-    p_err_func = lambda v: BM3_EOS_pressure(v, V0, K0, Kp0) - P
+def main():
+    """Main function to execute the EOS fitting and plotting"""
+    parser = argparse.ArgumentParser(
+        description="Fit a set of EVT data to isothermal 3rd order BM EOS",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument('datafiles', nargs='+', help='One file per volume to fit')
+    parser.add_argument('--plot_pv', default=None, help='Filename to save PV plot')
+    parser.add_argument('--plot_ev', default=None, help='Filename to save EV plot (Not Implemented)')
+    parser.add_argument('--plot_both', default=None, help='Filename to save stacked PV and EV plots')
+    parser.add_argument('--polyplot', default=None, help='Filename to save polynomial fits plot')
+    parser.add_argument('--latex_table', default=None, help='Filename to save LaTeX table of fitting parameters')
+    parser.add_argument('--max_t', default=2500.0, type=float, help='Maximum temperature to evaluate results (K)')
+    parser.add_argument('--min_t', default=300.0, type=float, help='Minimum temperature to evaluate results (K)')
+    parser.add_argument('--step_t', default=105.0, type=float, help='Temperature step to evaluate results (K)')
+    parser.add_argument('--max_p', default=101.0, type=float, help='Maximum pressure to evaluate results (GPa)')
+    parser.add_argument('--min_p', default=0.0, type=float, help='Minimum pressure to evaluate results (GPa)')
+    parser.add_argument('--step_p', default=1.0, type=float, help='Pressure step to evaluate results (GPa)')
+    parser.add_argument('--plot_temps', nargs='+', type=float, help='List of temperatures to plot')
+    parser.add_argument('--do_pv', action='store_true',
+                        help='Fit the volume-pressure data and report (static) EOS parameters')
+    parser.add_argument('--use_pv', action='store_true',
+                        help='Use volume-pressure EOS parameters as initial guess for FV fits')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
 
-    a, b = 0.8 * V0, 1.2 * V0
-    max_expansion = 10  # or some other limit based on physical reasoning
-    while max_expansion > 0:
-        try:
-            return spopt.brentq(p_err_func, a, b)
-        except ValueError:
-            a *= 0.9  # Expand the interval
-            b *= 1.1
-            max_expansion -= 1
-    raise ValueError("Could not find root after expanding the interval")
+    args = parser.parse_args()
 
+    # Parse data files
+    data = []
+    a_all, b_all, c_all = [], [], []
+    for file in args.datafiles:
+        logging.info(f"Reading data from: {file}")
+        parsed_data, ts, a, b, c = parse_castep_file(file, verbose=args.verbose)
+        data.extend(parsed_data)
+        a_all.append(a)
+        b_all.append(b)
+        c_all.append(c)
 
+    if not data:
+        logging.error("No data parsed from the provided files.")
+        return
 
-
-def read_data_file(filename, data):
-    "Read one of our datafiles and append to data array"
-    ts = []
-    with open(filename, 'r') as fh:
-        v = None
-        u = None
-        zpe = None
-        for line in fh:
-            words = line.split()
-            if v is None:
-                v = float(words[0])
-                u = float(words[1])
-                zpe = float(words[2])
-            else:
-                t = float(words[0])
-                f = float(words[1])
-                # FIXME: do we also want E, S and Cv, do we want to plot them?
-                data.append([v, u, zpe, t, None, f, None, None])
-                ts.append(t)
-
-    return data, ts
-
-
-def parse_castep_file(filename, current_data=[], verbose=False):
-    """Read a Castep output file with thermodynamic data and extract it
-
-       This appends thermodynamic data, in the form of a tuple, for
-       each temperature at which lattice dynamics was used to calculate
-       thermodynamic data. The tuple includes (in order) the cell
-       volume (A**3), static internal energy including the finite basis
-       set correctio (eV), the zero point energy (eV), the temperature
-       (K), vibrational energy (eV), vibriational component of the
-       Helmohotz free energy (eV), the entropy (J/mol/K) and heat
-       capacity (J/mol/K). These tuples are returned in a list
-       in the order found in the file. Multiple runs can be joined
-       together in one file and this is handled correctly. If multile
-       files need to be parsed the function can be called repetedly
-       with the output list passed in as the optional current_data
-       argument and new data will be appended to this list.
-    """
-
-    ts = []
-    fh = open(filename, 'r')
-    current_volume = None
-    in_thermo = False
-    skip_lines = 0
-    for line in fh:
-        if skip_lines > 0:
-            skip_lines = skip_lines - 1
-            continue
-        match = _vol_re.search(line)
-        if match:
-            # We need to keep track of the *current* volume
-            current_volume = float(match.group(1))
-            if verbose:
-                print(f"Volume: {current_volume}")
-            continue
-        match = _ufb_re.search(line)
-        if match:
-            U = float(match.group(1))
-            if verbose:
-                print(f"Internal energy: {U}")
-            continue
-        match = _enth_re.search(line)
-        if match:
-            H = float(match.group(1))
-            if verbose:
-                print(f"Enthalpy: {H}")
-            continue
-        match = _p_re.search(line)
-        if match:
-            # We need the actual pressure for PV correction
-            P = float(match.group(1))
-            if verbose:
-                print(f"Pressure: {P} GPa")
-        match = _zpe_re.search(line)
-        if match:
-            # A line with the zero point energy must start a
-            # thermo block. We need to skip three
-            # lines first though.
-            zpe = float(match.group(1))
-            if verbose:
-                print(f"Zero point energy energy: {zpe}")
-            in_thermo = True
-            skip_lines = 3
-            continue
-        if in_thermo:
-            # This is the bulk of the data in the table
-            match = _tmo_re.search(line)
-            if match:
-                T = float(match.group(1))
-                E = float(match.group(2))
-                F = float(match.group(3))
-                S = float(match.group(4))
-                Cv = float(match.group(5))
-                # If we want to use enthalpy (we don't)
-                # 1 eV/A^3 = 160.21766208 GPa
-                # we need U not H, U = H-PV
-                ## U was Unv ???
-                U = H - (current_volume * P / 160.21766208)
-                if verbose:
-                    print(f"T: {T}, H: {H}, U: {U}, F: {F}")
-                # A horrible hack from AMW...
-                # to limt T range for FeAlO3 pv
-                if T < 2500.0 and T != 0.0:
-                    current_data.append((current_volume, U, zpe, T,
-                                         E, F, S, Cv, P))
-                    ts.append(T)
-                continue
-            else:
-                # Must be at the end of this thermo table
-                in_thermo = False
-                zpe = None
-                U = None
-                current_volume = None
-                continue
-
-    fh.close()
-    return current_data, ts
-
-
-def get_VF(data_table, T):
-    """Given the data file from parse_castep_file return useful data at T
-       The data table is searched for data at the target temperature, T
-       (K), and numpy arrays of volumes (A**3) and the Helmholtz free
-       energy, F, (eV) is returned. Note that:
-           F(V,T) = U(V) + F_{vib}(V,T)
-       where U(V) (static) potential energy of the system at the chosen
-       volume and F_{vib}(V,T) is the vibrational Helmholtz free energy
-       given by:
-           F_{vib}(V,T) = ZPE(V) + E_{vib}(V,T) - T.S_{vib}(V,T)
-       i.e. the sum of the zero point energy, the phonon internal
-       energy and the phonon entropy. This second summation is
-       performed by Castep and F_{vib} is reported in the table of
-       thermodynamic quantaties.
-       If T==0 this function returns U(V)+ZPE(V), which can be used to
-       fit a true zero K EOS. If T=='static' just U(V) is returned, which
-       can be used to fit a athermal, or static, EOS.
-    """
-    # For static or 0K runs, we can use any T we choose, so use the
-    # first one in the table.
-    if T == 'static':
-        mode = 'static'
-        T = data_table[0][3]
-    elif T == 0:
-        mode = 'zpe'
-        T = data_table[0][3]
+    # Fit EOS parameters for static case
+    logging.info("Processing static case")
+    V_static, F_static, P_static = get_VF(data, 'static')
+    if args.do_pv or args.use_pv:
+        logging.info("Fitting to static PV data")
+        eos_pv = fit_pressure_eos(P_static, V_static, verbose=args.verbose)
+        v0_guess, k0_guess, kp0_guess = eos_pv.V0, eos_pv.K0, eos_pv.Kp0
     else:
-        mode = 'f'
+        v0_guess = k0_guess = kp0_guess = None
 
-    F = []
-    V = []
-    P = []
-    for line in data_table:
-        if line[3] == T:
-            if mode == 'static':
-                F.append(line[1])  # F(V,0) = U(V)
-                V.append(line[0])
-                P.append(line[-1])
-            elif mode == 'zpe':
-                F.append(line[2] + line[1])  # F(V,0) = U(V)+ZPE(V)
-                V.append(line[0])
-            else:
-                # Move to total helmholtz free energy
-                # this is U_0(V) + F_vib(V,T)
-                F.append(line[5] + line[1])
-                V.append(line[0])
-    F = np.array(F)
-    V = np.array(V)
-    if mode == 'static':
-        P = np.array(P)
-        return V, F, P
-    return V, F
+    # Fit BM3 EOS for static case
+    eos_static = fit_eos(
+        V_static,
+        F_static,
+        initial_guesses=[v0_guess, F_static.mean(), k0_guess, kp0_guess] if args.use_pv else None,
+        verbose=args.verbose
+    )
+
+    # Fit EOS parameters for all temperatures (including 0K)
+    unique_ts = sorted(set([entry[3] for entry in data if entry[3] != 0.0]))
+    unique_ts = [0.0] + unique_ts  # Include 0K
+    eos_params = []
+    vs, fs = [], []
+
+    # Parallel fitting for efficiency
+    def fit_at_temperature(T):
+        if T == 'static':
+            V, F, P = V_static, F_static, P_static
+        elif T == 0.0:
+            V, F, _ = get_VF(data, 0.0)
+        else:
+            V, F, _ = get_VF(data, T)
+
+        if args.use_pv and T == 'static':
+            params = eos_static
+        else:
+            params = fit_eos(V, F, verbose=args.verbose)
+        return (params, V, F)
+
+    results = Parallel(n_jobs=-1)(
+        delayed(fit_at_temperature)(T) for T in unique_ts
+    )
+
+    for params, V, F in results:
+        eos_params.append(params)
+        vs.append(V)
+        fs.append(F)
+
+    # Determine volume range for plotting
+    all_volumes = np.concatenate(vs)
+    min_V, max_V = np.min(all_volumes), np.max(all_volumes)
+
+    # Plotting
+    if args.plot_both:
+        logging.info(f"Creating stacked PV and EV plots: {args.plot_both}")
+        plot_twoplots(min_V, max_V, vs, fs, eos_params, unique_ts, filename=args.plot_both)
+
+    if args.plot_pv:
+        logging.info(f"Creating PV plot: {args.plot_pv}")
+        plt.figure(figsize=(8, 6))
+        for params, T in zip(eos_params, unique_ts):
+            if T == 'static' or T == 0.0:
+                continue  # Skip static and 0K for pressure plot
+            V_fine = np.linspace(min_V, max_V, 100)
+            P_fit = bm3_eos_pressure(V_fine, params.V0, params.K0, params.Kp0) * 160.218  # GPa
+            plt.plot(P_fit, V_fine, '-', label=f'{T} K')
+        plt.xlabel('Pressure (GPa)')
+        plt.ylabel('Volume (Å³)')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(args.plot_pv, dpi=900)
+        plt.close()
+
+    if args.polyplot or args.latex_table:
+        # Extract parameter arrays
+        Ts = np.array(unique_ts)
+        V0s = np.array([p.V0 for p in eos_params])
+        E0s = np.array([p.E0 for p in eos_params])
+        K0s = np.array([p.K0 for p in eos_params])
+        Kp0s = np.array([p.Kp0 for p in eos_params])
+
+        # Fit quintic polynomials
+        fv0, fe0, fk0, fkp0 = fit_parameters_quintic(
+            Ts,
+            V0s,
+            E0s,
+            K0s,
+            Kp0s,
+            plot=bool(args.polyplot),
+            filename=args.polyplot,
+            table=args.latex_table
+        )
+
+    # Evaluate and print results over pressure and temperature ranges
+    if args.polyplot or args.latex_table:
+        logging.info("Evaluating volumes over P-T grid")
+        for P in np.arange(args.min_p, args.max_p + args.step_p, args.step_p):
+            for T in np.arange(args.min_t, args.max_t + args.step_t, args.step_t):
+                try:
+                    V = get_volume(P, T, fv0, fk0, fkp0)
+                    print(f"{P:.2f} GPa, {T:.2f} K, {V:.4f} Å³")
+                except ValueError as e:
+                    logging.warning(f"Could not determine volume for P={P} GPa, T={T} K: {e}")
 
 
 if __name__ == "__main__":
-    # If run from the command line read data from files and
-    # evaluate / plot EOS or report results
-    help_str = """Fit a set of EVT data to isothermal 3rd order BM EOS
-
-                Data must be supplied in files (one for each cell volume)
-                which consist of the cell volume (in cubic angstroms) internal
-                energy and zero point energy (both in electron volts) on
-                the first line followed by a serise of lines each with a
-                temperature (in K, must increase down the file) and the 
-                free energy. By default each file is read and an isothermal
-                EOS is fitted for each temperature. The parameters are fitted
-                to a quintic polynomial. The volume is then evaluate on a grid
-                of PVT points and written to standard output. Plots can be
-                created (and data can be written to files).
-             """
-
-    import argparse
-
-    parser = argparse.ArgumentParser(description=help_str)
-    parser.add_argument('datafiles', nargs='+',
-                        help='One file per volume to fit')
-    parser.add_argument('--plot_pv', default=None,
-                        help='Create a graph of the PV data and fit')
-    parser.add_argument('--plot_ev', default=None,
-                        help='Create a graph of the EV data and fit')
-    parser.add_argument('--plot_both', default=None,
-                        help='Create stacked PV and EV plots')
-    parser.add_argument('--polyplot', default=None,
-                        help='Plot the polynomial fits')
-    parser.add_argument('--latex_table', default=None,
-                        help='Create LaTeX file of fitting parameters')
-    parser.add_argument('--max_t', default=2500, type=float,
-                        help='Maximum temperature to evaulate results (K)')
-    parser.add_argument('--min_t', default=300, type=float,
-                        help='Minimum temperature to evaulate results (K)')
-    parser.add_argument('--step_t', default=105, type=float,
-                        help='Temperature step to evaulate results (K)')
-    parser.add_argument('--max_p', default=50, type=float,
-                        help='Maximum temperature to evaulate results (GPa)')
-    parser.add_argument('--min_p', default=0, type=float,
-                        help='Minimum temperature to evaulate results (GPa)')
-    parser.add_argument('--step_p', default=10, type=float,
-                        help='Temperature step to evaulate results (GPa)')
-    parser.add_argument('--plot_temps', nargs='+', type=float,
-                        help='List of temperatures to plot')
-    parser.add_argument('--do_pv', default=False, type=bool,
-                        help='Fit the volume-pressure data and report (static) EOS parameters')
-    parser.add_argument('--use_pv', default=False, type=bool,
-                        help='Use volume-pressure EOS parameters as initial guess for FV fits')
-    args = parser.parse_args()
-
-    # Build basic data table
-    data = []
-    for file in args.datafiles:
-        print("Reading data from: ", file)
-        # data, ts = read_data_file(file, data)
-        # NB: we assume that ts is the same for each file!
-        data, ts = parse_castep_file(file, data, verbose=False)
-
-    # Fit EOS parameters at each T and store
-    vs = []
-    fs = []
-    k0s = []
-    kp0s = []
-    e0s = []
-    v0s = []
-    min_v = 1.0E12
-    max_v = 0.0
-    print("Working on static case")
-    v, f, p = get_VF(data, 'static')
-    print(p)
-    print(v)
-    print(f)
-    if args.use_pv or args.do_pv:
-        print("Fitting to static PV data")
-        v0_guess, k0_guess, kp0_guess = fit_BM3_pressure_EOS(p, v, verbose=True)
-    if not args.do_pv:
-        # Guesses back to default
-        v0_guess = None
-        k0_guess = None
-        kp0_guess = None
-
-    v0, e0, k0, kp0 = fit_BM3_EOS(v, f, V0_guess=v0_guess,
-                                  K0_guess=k0_guess, Kp0_guess=kp0_guess, verbose=True)
-    print("Working on 0K case")
-    v, f = get_VF(data, 0.0)
-    print(v)
-    print(f)
-    v0, e0, k0, kp0 = fit_BM3_EOS(v, f, V0_guess=v0_guess,
-                                  K0_guess=k0_guess, Kp0_guess=kp0_guess, verbose=True)
-    ts = [0] + ts
-    for t in ts:
-        print("Working on:", t, "K")
-        v, f = get_VF(data, t)
-        print(v)
-        print(f)
-        v0, e0, k0, kp0 = fit_BM3_EOS(v, f, verbose=True)
-        if np.max(v) > max_v: max_v = np.max(v)
-        if np.min(v) < min_v: min_v = np.min(v)
-        vs.append(v)
-        fs.append(f)
-        k0s.append(k0)
-        kp0s.append(kp0)
-        e0s.append(e0)
-        v0s.append(v0)
-
-    # If we need them, plot graphs of isothemal EOS
-    if args.plot_both is not None:
-        BM3_EOS_twoplots(np.floor(min_v), np.ceil(max_v),
-                         vs, fs, v0s, e0s, k0s, kp0s, ts, filename=args.plot_both)
-
-    if args.plot_pv is not None:
-        # Plot only the PV data
-        BM3_EOS_pressure_plot(np.floor(min_v), np.ceil(max_v), v0s, k0s, kp0s, Ts=ts, filename=args.plot_pv)
-
-    if args.plot_ev is not None:
-        raise NotImplementedError
-
-    # now fit the polynomials, plotting if needed
-    pplot = False
-    if args.polyplot is not None:
-        pplot = True
-    fv0, fe0, fk0, fkp0 = fit_parameters_quad(ts, v0s, e0s, k0s, kp0s,
-                                              plot=pplot, filename=args.polyplot, table=args.latex_table)
-
-    print("P (GPa) T (K) V (ang**3)")
-    for evalp in np.arange(args.min_p, args.max_p, args.step_p):
-        for evalt in np.arange(args.min_t, args.max_t, args.step_t):
-            print(evalp, evalt, get_V(evalp, evalt, fv0, fk0, fkp0))
+    main()
